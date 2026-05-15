@@ -1,0 +1,438 @@
+<script context="module" lang="ts">
+	export const TABS = {};
+
+	export interface Tab {
+		label: string;
+		id: string | number;
+		elem_id: string | undefined;
+		visible: boolean | "hidden";
+		interactive: boolean;
+		scale: number | null;
+		component_id: number;
+	}
+</script>
+
+<script lang="ts">
+	import { setContext, createEventDispatcher, tick, onMount } from "svelte";
+	import OverflowIcon from "./OverflowIcon.svelte";
+	import { writable } from "svelte/store";
+	import type { SelectData } from "@gradio/utils";
+
+	export let visible: boolean | "hidden" = true;
+	export let elem_id = "";
+	export let elem_classes: string[] = [];
+	export let selected: number | string;
+	export let initial_tabs: Tab[];
+
+	let tabs: (Tab | null)[] = [...initial_tabs];
+	let visible_tabs: (Tab | null)[] = [...initial_tabs];
+	let overflow_tabs: (Tab | null)[] = [];
+	let overflow_menu_open = false;
+	let overflow_menu: HTMLElement;
+
+	// Track which tab orders have been registered by mounted TabItem components.
+	// Once a TabItem mounts and calls register_tab, it manages its own tab entry
+	// via _set_data -> register_tab, so _sync_tabs should not overwrite it.
+	let mounted_tab_orders: Set<number> = new Set();
+
+	// When initial_tabs changes (e.g. a non-mounted tab's props were updated),
+	// sync the internal tabs array so the tab buttons reflect the new state.
+	// Using a function call so the $: dependency is only on initial_tabs,
+	// not on tabs (which would cause a loop with register_tab).
+	$: _sync_tabs(initial_tabs);
+
+	function _sync_tabs(new_tabs: Tab[]): void {
+		for (let i = 0; i < new_tabs.length; i++) {
+			if (new_tabs[i] && !mounted_tab_orders.has(i)) {
+				tabs[i] = new_tabs[i];
+			}
+		}
+	}
+
+	$: has_tabs = tabs.length > 0;
+
+	let tab_nav_el: HTMLDivElement;
+
+	const selected_tab = writable<false | number | string>(
+		selected || tabs[0]?.id || false
+	);
+	const selected_tab_index = writable<number>(
+		tabs.findIndex((t) => t?.id === selected) || 0
+	);
+	const dispatch = createEventDispatcher<{
+		change: undefined;
+		select: SelectData;
+	}>();
+
+	let is_overflowing = false;
+	let overflow_has_selected_tab = false;
+	let tab_els: Record<string | number, HTMLElement> = {};
+
+	onMount(() => {
+		if (!tab_nav_el) return;
+		const ro = new ResizeObserver(() => {
+			handle_menu_overflow();
+		});
+		ro.observe(tab_nav_el);
+		return () => ro.disconnect();
+	});
+
+	setContext(TABS, {
+		register_tab: (tab: Tab, order: number) => {
+			mounted_tab_orders.add(order);
+			tabs[order] = tab;
+
+			if ($selected_tab === false && tab.visible !== false && tab.interactive) {
+				$selected_tab = tab.id;
+				$selected_tab_index = order;
+			}
+			return order;
+		},
+		unregister_tab: (tab: Tab, order: number) => {
+			mounted_tab_orders.delete(order);
+			if ($selected_tab === tab.id) {
+				$selected_tab = tabs[0]?.id || false;
+			}
+			tabs[order] = null;
+		},
+		selected_tab,
+		selected_tab_index
+	});
+
+	function change_tab(id: string | number | undefined): void {
+		const tab_to_activate = tabs.find((t) => t?.id === id);
+		if (
+			id !== undefined &&
+			tab_to_activate &&
+			tab_to_activate.interactive &&
+			tab_to_activate.visible !== false &&
+			$selected_tab !== tab_to_activate.id
+		) {
+			selected = id;
+			$selected_tab = id;
+			$selected_tab_index = tabs.findIndex((t) => t?.id === id);
+			dispatch("change");
+			overflow_menu_open = false;
+		}
+	}
+
+	$: (tabs, selected !== null && change_tab(selected));
+	$: (tabs, tab_nav_el, tab_els, handle_menu_overflow());
+
+	function handle_outside_click(event: MouseEvent): void {
+		if (
+			overflow_menu_open &&
+			overflow_menu &&
+			!overflow_menu.contains(event.target as Node)
+		) {
+			overflow_menu_open = false;
+		}
+	}
+
+	// approximate width of the "..." overflow button including margin
+	const OVERFLOW_BTN_RESERVE = 48;
+
+	async function handle_menu_overflow(): Promise<void> {
+		if (!tab_nav_el) return;
+
+		await tick();
+		await new Promise((r) => requestAnimationFrame(r));
+
+		const available = tab_nav_el.clientWidth;
+
+		let cumulative = 0;
+		let split_index = tabs.length;
+
+		for (let i = 0; i < tabs.length; i++) {
+			const tab = tabs[i];
+			if (!tab || tab.visible === false || tab.visible === "hidden") continue;
+			const el = tab_els[tab.id];
+			if (!el) continue;
+			cumulative += el.getBoundingClientRect().width;
+			const has_more = tabs
+				.slice(i + 1)
+				.some((t) => t && t.visible !== false && t.visible !== "hidden");
+			const limit = has_more ? available - OVERFLOW_BTN_RESERVE : available;
+			if (cumulative > limit) {
+				split_index = i;
+				break;
+			}
+		}
+
+		visible_tabs = tabs.slice(0, split_index);
+		overflow_tabs = tabs.slice(split_index);
+
+		overflow_has_selected_tab = handle_overflow_has_selected_tab($selected_tab);
+		is_overflowing =
+			overflow_tabs.filter((t) => t && t.visible !== false).length > 0;
+	}
+
+	$: overflow_has_selected_tab =
+		handle_overflow_has_selected_tab($selected_tab);
+
+	function handle_overflow_has_selected_tab(
+		selected_tab: number | string | false
+	): boolean {
+		if (selected_tab === false) return false;
+		return overflow_tabs.some((t) => t?.id === selected_tab);
+	}
+
+	$: tab_scale =
+		tabs[$selected_tab_index >= 0 ? $selected_tab_index : 0]?.scale;
+</script>
+
+<svelte:window
+	on:resize={handle_menu_overflow}
+	on:click={handle_outside_click}
+/>
+
+<div
+	class="tabs {elem_classes.join(' ')}"
+	class:hide={visible === false}
+	class:hidden={visible === "hidden"}
+	id={elem_id}
+	style:flex-grow={tab_scale}
+>
+	{#if has_tabs}
+		<div class="tab-wrapper">
+			<div class="tab-container visually-hidden" aria-hidden="true">
+				{#each tabs as t, i}
+					{#if t && t?.visible !== false && t?.visible !== "hidden"}
+						<button bind:this={tab_els[t.id]}>
+							{t?.label}
+						</button>
+					{/if}
+				{/each}
+			</div>
+			<div class="tab-container" bind:this={tab_nav_el} role="tablist">
+				{#each visible_tabs as t, i}
+					{#if t && t?.visible !== false}
+						<button
+							role="tab"
+							class:selected={t.id === $selected_tab}
+							aria-selected={t.id === $selected_tab}
+							aria-controls={t.elem_id}
+							disabled={!t.interactive}
+							aria-disabled={!t.interactive}
+							id={t.elem_id ? t.elem_id + "-button" : null}
+							data-tab-id={t.id}
+							on:click={() => {
+								if (t.id !== $selected_tab) {
+									change_tab(t.id);
+									dispatch("select", {
+										value: t.label,
+										index: i,
+										id: t.id,
+										component_id: t.component_id
+									});
+								}
+							}}
+						>
+							{t?.label !== undefined ? t?.label : "Tab " + (i + 1)}
+						</button>
+					{/if}
+				{/each}
+			</div>
+			<span
+				class="overflow-menu"
+				class:hide={!is_overflowing ||
+					!overflow_tabs.some((t) => t?.visible !== false)}
+				bind:this={overflow_menu}
+			>
+				<button
+					on:click|stopPropagation={() =>
+						(overflow_menu_open = !overflow_menu_open)}
+					class:overflow-item-selected={overflow_has_selected_tab}
+				>
+					<OverflowIcon />
+				</button>
+				<div class="overflow-dropdown" class:hide={!overflow_menu_open}>
+					{#each overflow_tabs as t, i}
+						{#if t?.visible !== false}
+							<button
+								on:click={() => {
+									change_tab(t?.id);
+									dispatch("select", {
+										value: t.label,
+										index: i,
+										id: t.id,
+										component_id: t.component_id
+									});
+								}}
+								class:selected={t?.id === $selected_tab}
+							>
+								{t?.label}
+							</button>
+						{/if}
+					{/each}
+				</div>
+			</span>
+		</div>
+	{/if}
+	<slot />
+</div>
+
+<style>
+	.tabs {
+		position: relative;
+		flex-direction: column;
+	}
+
+	.hide {
+		display: none;
+	}
+
+	.hidden {
+		display: none !important;
+	}
+
+	.tab-wrapper {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		position: relative;
+		height: var(--size-8);
+		padding-bottom: var(--size-2);
+		margin-bottom: var(--layout-gap);
+	}
+
+	.tab-container {
+		display: flex;
+		align-items: center;
+		width: 100%;
+		position: relative;
+		overflow: hidden;
+		height: var(--size-8);
+	}
+
+	.tab-container::after {
+		content: "";
+		position: absolute;
+		bottom: 0;
+		left: 0;
+		right: 0;
+		height: 1px;
+		background-color: var(--border-color-primary);
+	}
+
+	.overflow-menu {
+		flex-shrink: 0;
+		margin-left: var(--size-2);
+	}
+
+	button {
+		margin-bottom: 0;
+		border: none;
+		border-radius: 0;
+		padding: 0 var(--size-4);
+		color: var(--body-text-color);
+		font-weight: var(--section-header-text-weight);
+		font-size: var(--section-header-text-size);
+		transition: background-color color 0.2s ease-out;
+		background-color: transparent;
+		height: 100%;
+		display: flex;
+		align-items: center;
+		white-space: nowrap;
+		position: relative;
+	}
+
+	button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	button:hover:not(:disabled):not(.selected) {
+		background-color: var(--background-fill-secondary);
+		color: var(--body-text-color);
+	}
+
+	.selected {
+		background-color: transparent;
+		color: var(--color-accent);
+		position: relative;
+	}
+
+	.selected::after {
+		content: "";
+		position: absolute;
+		bottom: 0;
+		left: 0;
+		width: 100%;
+		height: 2px;
+		background-color: var(--color-accent);
+		animation: fade-grow 0.2s ease-out forwards;
+		transform-origin: center;
+		z-index: 1;
+	}
+
+	@keyframes fade-grow {
+		from {
+			opacity: 0;
+			transform: scaleX(0.8);
+		}
+		to {
+			opacity: 1;
+			transform: scaleX(1);
+		}
+	}
+
+	.overflow-dropdown {
+		position: absolute;
+		top: calc(100% + var(--size-2));
+		right: 0;
+		background-color: var(--background-fill-primary);
+		border: 1px solid var(--border-color-primary);
+		border-radius: var(--radius-sm);
+		z-index: var(--layer-5);
+		box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+		padding: var(--size-2);
+		min-width: 150px;
+		width: max-content;
+	}
+
+	.overflow-dropdown button {
+		display: block;
+		width: 100%;
+		text-align: left;
+		padding: var(--size-2);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.overflow-menu > button {
+		padding: var(--size-1) var(--size-2);
+		min-width: auto;
+		border: 1px solid var(--border-color-primary);
+		border-radius: var(--radius-sm);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.overflow-menu > button:hover {
+		background-color: var(--background-fill-secondary);
+	}
+
+	.overflow-menu :global(svg) {
+		width: 16px;
+		height: 16px;
+	}
+
+	.overflow-item-selected :global(svg) {
+		color: var(--color-accent);
+	}
+
+	.visually-hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+</style>
